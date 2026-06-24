@@ -35,6 +35,7 @@ PLACEHOLDER_GIF = bytes.fromhex(
     '47494638396101000100800100000000ffffff21f90401000001002c00000000010001000002024c01003b')
 
 _ORIG_FETCH_BYTES = khrc.fetch_bytes
+_ORIG_FETCH_JSON = khrc.fetch_json
 
 
 # --- test doubles ------------------------------------------------------------
@@ -121,6 +122,17 @@ class AmazonSpy(object):
         return self.plugins
 
 
+class JsonSpy(object):
+    """Stands in for fetch_json(); returns canned data, records url and calls."""
+    def __init__(self, data):
+        self.data, self.calls, self.url = data, 0, None
+
+    def __call__(self, log, url, timeout):
+        self.calls += 1
+        self.url = url
+        return self.data
+
+
 def use_browsers(browsers=None, always=None):
     factory = BrowserFactory(browsers=browsers, always=always)
     khrc.browser = factory
@@ -141,6 +153,12 @@ def use_covers(mapping, default=PLACEHOLDER_GIF):
                 return data
         return default
     khrc.fetch_bytes = fake
+
+
+def use_openlibrary(data):
+    spy = JsonSpy(data)
+    khrc.fetch_json = spy
+    return spy
 
 
 HTTP_503 = Exception('HTTP Error 503: Service Unavailable')
@@ -269,24 +287,45 @@ def test_cover_urls_for_asin():
     eq('no valid cover -> []', khrc.cover_urls_for_asin(log, 'CCCC', 5), [])
 
 
-# --- search_edition_goodreads ------------------------------------------------
-def test_search_edition_goodreads():
+# --- fetch_json / search_asins_openlibrary -----------------------------------
+def test_fetch_json():
+    khrc.fetch_json = _ORIG_FETCH_JSON
+    khrc.fetch_bytes = _ORIG_FETCH_BYTES
     log = FakeLog()
+
+    use_browsers([FakeBrowser(body=b'{"docs": [{"isbn": ["0307762521"]}]}')])
+    eq('parses json', khrc.fetch_json(log, 'http://ol/s', 5), {'docs': [{'isbn': ['0307762521']}]})
+
+    use_browsers([FakeBrowser(body=b'<html>not json</html>')])
+    eq('bad json -> None', khrc.fetch_json(log, 'http://ol/s', 5), None)
+
     use_browsers(always=FakeBrowser(error=HTTP_503))
-    eq('503 -> None', khrc.search_edition_goodreads(log, 'neuromancer'), None)
+    eq('fetch fails -> None', khrc.fetch_json(log, 'http://ol/s', 5), None)
 
-    redirect = GOODREADS + '/book/show/999'
-    use_browsers([FakeBrowser(body='whatever', final_url=redirect)])
-    eq('redirect -> edition', khrc.search_edition_goodreads(log, 'neuromancer'), redirect)
 
-    page = '<html><body><div itemtype="http://schema.org/Book">' \
-           '<a itemprop="url" href="/book/show/555">x</a></div></body></html>'
-    use_browsers([FakeBrowser(body=page)])
-    eq('first result -> edition', khrc.search_edition_goodreads(log, 'neuromancer'),
-       GOODREADS + '/book/show/555')
+def test_search_asins_openlibrary():
+    log = FakeLog()
 
-    use_browsers([FakeBrowser(body='')])
-    eq('empty -> None', khrc.search_edition_goodreads(log, 'neuromancer'), None)
+    spy = use_openlibrary({'docs': [{'isbn': ['0307387895', '9780441013593']},
+                                    {'isbn': ['043935806X']}]})
+    asins = khrc.search_asins_openlibrary(log, 'The Road', ['Cormac McCarthy'], None, 5)
+    eq('derives + dedupes asins from isbns', asins, ['0307387895', '0441013597', '043935806X'])
+    check('title+author query used', 'title=' in spy.url and 'author=' in spy.url)
+
+    spy = use_openlibrary({'docs': [{'isbn': ['0307762521']}]})
+    asins = khrc.search_asins_openlibrary(log, None, None, '9780307762528', 5)
+    eq('isbn-only -> q query', asins, ['0307762521'])
+    check('q query used', 'q=' in spy.url and 'title=' not in spy.url)
+
+    use_openlibrary(None)
+    eq('no json -> []', khrc.search_asins_openlibrary(log, 'X', ['Y'], None, 5), [])
+
+    use_openlibrary({'docs': []})
+    eq('no docs -> []', khrc.search_asins_openlibrary(log, 'X', ['Y'], None, 5), [])
+
+    spy = use_openlibrary({'docs': [{'isbn': ['x']}]})
+    eq('nothing to query -> []', khrc.search_asins_openlibrary(log, None, None, None, 5), [])
+    eq('no query -> no fetch', spy.calls, 0)
 
 
 # --- search_asins_goodreads --------------------------------------------------
@@ -331,49 +370,70 @@ def test_get_cover_urls():
     log = FakeLog()
 
     # The reported bug: Goodreads 503, ISBN present. Must NOT crash, must emit the
-    # working _SCLZZZZZZZ_ url for the ISBN-derived ASIN, and must NOT touch the
-    # Google-scraping Amazon source because a real cover was already found.
+    # working _SCLZZZZZZZ_ url for the ISBN-derived ASIN, and must touch neither
+    # OpenLibrary nor the Amazon source because a real cover was already found.
     b = use_browsers(always=FakeBrowser(error=HTTP_503))
+    ol = use_openlibrary({'docs': [{'isbn': ['SHOULD_NOT']}]})
     amz = use_amazon([FakeAmazonSource(asins=['SHOULD_NOT'])])
     use_covers({'0307762521': JPEG})
     urls = khrc.get_cover_urls(log, 'Blood Meridian', ['Cormac McCarthy'],
                                {'goodreads': '8812697', 'isbn': '9780307762528'}, 5)
     eq('isbn cover, real url', urls, [SCL % '0307762521'])
     check('goodreads attempted', b.calls >= 1)
+    eq('openlibrary NOT called', ol.calls, 0)
     eq('amazon source NOT called', amz.calls, 0)
 
-    # ISBN-derived ASIN has no cover (placeholder) -> escalate to Amazon source,
-    # whose Kindle ASIN does have a cover.
+    # ISBN edition has no cover -> OpenLibrary finds another edition that does,
+    # and the Google-scraping Amazon source is never reached.
     use_browsers(always=FakeBrowser(error=HTTP_503))
-    amz = use_amazon([FakeAmazonSource(asins=['B00X57B4JG'])])
-    use_covers({'B00X57B4JG': JPEG})  # 0307762521 -> placeholder (default)
+    ol = use_openlibrary({'docs': [{'isbn': ['0307387895']}]})  # alternate edition
+    amz = use_amazon([FakeAmazonSource(asins=['SHOULD_NOT'])])
+    use_covers({'0307387895': JPEG})  # 0307762521 -> placeholder (default)
     urls = khrc.get_cover_urls(log, 'Blood Meridian', ['Cormac McCarthy'],
                                {'isbn': '9780307762528'}, 5)
-    eq('escalates to amazon when isbn has no cover', urls, [SCL % 'B00X57B4JG'])
+    eq('openlibrary alternate edition cover', urls, [SCL % '0307387895'])
+    check('openlibrary WAS called', ol.calls >= 1)
+    eq('amazon source NOT reached', amz.calls, 0)
+
+    # Nothing cheap works and OpenLibrary finds nothing -> Amazon source (last
+    # resort) supplies a Kindle ASIN with a cover.
+    use_browsers(always=FakeBrowser(error=HTTP_503))
+    ol = use_openlibrary({'docs': []})
+    amz = use_amazon([FakeAmazonSource(asins=['B00X57B4JG'])])
+    use_covers({'B00X57B4JG': JPEG})
+    urls = khrc.get_cover_urls(log, 'Blood Meridian', ['Cormac McCarthy'],
+                               {'isbn': '9780307762528'}, 5)
+    eq('amazon source last resort', urls, [SCL % 'B00X57B4JG'])
+    check('openlibrary tried first', ol.calls >= 1)
     check('amazon source WAS called', amz.calls >= 1)
 
     # ASIN already in metadata, real cover -> used directly, no network at all.
     b = use_browsers(always=FakeBrowser(error=AssertionError('no network expected')))
+    ol = use_openlibrary({'docs': [{'isbn': ['SHOULD_NOT']}]})
     amz = use_amazon([FakeAmazonSource(asins=['SHOULD_NOT'])])
     use_covers({'B00X57B4JG': JPEG})
     urls = khrc.get_cover_urls(log, 'T', ['A'], {'amazon': 'B00X57B4JG'}, 5)
     eq('metadata asin used directly', urls, [SCL % 'B00X57B4JG'])
     eq('no goodreads for metadata asin', b.calls, 0)
+    eq('no openlibrary for metadata asin', ol.calls, 0)
     eq('no amazon source for metadata asin', amz.calls, 0)
 
-    # Goodreads id resolves a Kindle ASIN with a cover -> Amazon source untouched.
+    # Goodreads id resolves a Kindle ASIN with a cover -> nothing else consulted.
     details = '<html><body><div class="otherEditionsLink">' \
               '<a href="/work/editions/123">All</a></div></body></html>'
     editions = '<html><body><div class="dataValue">B00X57B4JG</div></body></html>'
     use_browsers([FakeBrowser(body=details), FakeBrowser(body=editions)])
+    ol = use_openlibrary({'docs': [{'isbn': ['SHOULD_NOT']}]})
     amz = use_amazon([FakeAmazonSource(asins=['SHOULD_NOT'])])
     use_covers({'B00X57B4JG': JPEG})
     urls = khrc.get_cover_urls(log, 'T', ['A'], {'goodreads': '8812697'}, 5)
     eq('goodreads id resolves cover', urls, [SCL % 'B00X57B4JG'])
+    eq('no openlibrary when goodreads wins', ol.calls, 0)
     eq('no amazon source when goodreads wins', amz.calls, 0)
 
-    # Nothing resolves a cover -> empty list, no crash.
+    # Nothing resolves a cover anywhere -> empty list, no crash.
     use_browsers(always=FakeBrowser(error=HTTP_503))
+    use_openlibrary(None)
     use_amazon([])
     use_covers({})
     urls = khrc.get_cover_urls(log, 'Unknown', ['Nobody'], {'isbn': '9780307762528'}, 5)
@@ -384,7 +444,7 @@ def main():
     tests = [
         test_isbn_to_asin, test_is_asin, test_is_kindle_asin, test_parse_response,
         test_open_url, test_fetch_bytes, test_is_valid_cover, test_cover_urls_for_asin,
-        test_search_edition_goodreads, test_search_asins_goodreads,
+        test_fetch_json, test_search_asins_openlibrary, test_search_asins_goodreads,
         test_search_asins_amazon, test_get_cover_urls,
     ]
     for t in tests:

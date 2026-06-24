@@ -1,3 +1,4 @@
+import json
 import re
 from calibre import as_unicode
 from calibre import browser
@@ -8,7 +9,7 @@ from lxml.html import fromstring
 from lxml.etree import ParserError
 from six import iteritems
 from six.moves.queue import Queue, Empty
-from six.moves.urllib.parse import urljoin, quote_plus
+from six.moves.urllib.parse import urljoin, urlencode
 from threading import Event
 
 class KindleHighResCovers(Source):
@@ -49,6 +50,12 @@ COVER_URL_FORMATS = (
 # Amazon's "no cover" placeholder is a 43-byte 1x1 GIF. Real covers are tens of
 # KB of JPEG/PNG, so anything smaller than this is treated as a placeholder.
 MIN_COVER_BYTES = 1000
+
+# OpenLibrary's search API resolves a title/author or ISBN to the ISBNs of all
+# known editions (clean JSON, no scraping). Cap how many we validate against
+# Amazon so an obscure book doesn't trigger dozens of cover fetches.
+openlibrary_url = 'https://openlibrary.org/search.json'
+MAX_OPENLIBRARY_CANDIDATES = 10
 
 def get_cover_urls(log, title, authors, identifiers, timeout, abort=None):
     if abort is None:
@@ -91,34 +98,33 @@ def get_cover_urls(log, title, authors, identifiers, timeout, abort=None):
     # Validate the cheap candidates; keep only ASINs that have a real cover.
     urls = cover_urls_for_asins(log, asins, timeout)
 
-    # 4. Only now, if nothing has a cover, pay for calibre's Amazon source
-    #    (it scrapes search engines and is slow/rate-limited).
+    # 4. Resolve via OpenLibrary's search API (clean JSON, no scraping). It
+    #    returns ISBNs across every edition, so even if the metadata edition has
+    #    no Amazon cover, another edition often does.
+    if not urls:
+        log.info('No cover yet; searching OpenLibrary')
+        extra = [a for a in search_asins_openlibrary(log, title, authors, isbn, timeout)
+                 if a not in asins]
+        urls = cover_urls_for_asins(log, extra[:MAX_OPENLIBRARY_CANDIDATES], timeout, limit=2)
+        asins.extend(extra)
+
+    # 5. Absolute last resort: calibre's Amazon source, which scrapes search
+    #    engines and is slow/rate-limited. Reached only when nothing above found
+    #    a cover, so the common cases never touch a search engine.
     if not urls:
         log.info('No cover yet; falling back to calibre Amazon source')
         extra = [a for a in search_asins_amazon(log, title, authors, identifiers, timeout, abort)
                  if a not in asins]
-        urls = cover_urls_for_asins(log, extra, timeout)
-        asins.extend(extra)
-
-    # 5. Last resort: search Goodreads by ISBN or title+author (often blocked).
-    if not urls:
-        query = isbn
-        if not query and title:
-            query = title
-            if authors and authors[0]:
-                query = query + ' ' + authors[0]
-        if query:
-            edition = search_edition_goodreads(log, query)
-            if edition:
-                extra = [a for a in search_asins_goodreads(log, edition) if a not in asins]
-                urls = cover_urls_for_asins(log, extra, timeout)
+        urls = cover_urls_for_asins(log, extra, timeout, limit=2)
 
     return urls
 
-def cover_urls_for_asins(log, asins, timeout):
+def cover_urls_for_asins(log, asins, timeout, limit=None):
     urls = []
     for asin in asins:
         urls.extend(cover_urls_for_asin(log, asin, timeout))
+        if limit and len(urls) >= limit:
+            break
     return urls
 
 def cover_urls_for_asin(log, asin, timeout):
@@ -148,6 +154,45 @@ def fetch_bytes(log, url, timeout):
     except Exception as e:
         log.error('Failed to fetch %s: %s' % (url, e))
         return None
+
+def fetch_json(log, url, timeout):
+    data = fetch_bytes(log, url, timeout)
+    if not data:
+        return None
+    try:
+        return json.loads(data)
+    except ValueError as e:
+        log.error('Failed to parse JSON from %s: %s' % (url, e))
+        return None
+
+def search_asins_openlibrary(log, title, authors, isbn, timeout):
+    # Resolve the book to candidate ASINs via OpenLibrary's search API. A
+    # title+author query returns ISBNs across many editions; fall back to an
+    # ISBN query when that's all we have.
+    params = []
+    if title:
+        params.append(('title', title))
+        if authors and authors[0]:
+            params.append(('author', authors[0]))
+    elif isbn:
+        params.append(('q', isbn))
+    else:
+        return []
+    params.append(('fields', 'isbn'))
+    params.append(('limit', '5'))
+    url = openlibrary_url + '?' + urlencode(params)
+    log.info('Searching OpenLibrary: %s' % url)
+
+    data = fetch_json(log, url, timeout)
+    if not data:
+        return []
+    asins = []
+    for doc in data.get('docs', []):
+        for raw in doc.get('isbn', []):
+            asin = isbn_to_asin(raw)
+            if asin and asin not in asins:
+                asins.append(asin)
+    return asins
 
 def is_kindle_asin(value):
     return value and len(value) == 10 and value.startswith('B')
@@ -240,26 +285,6 @@ def open_url(log, url):
     except Exception as e:
         log.error('Failed to fetch %s: %s' % (url, e))
         return None, None
-
-def search_edition_goodreads(log, query):
-    search_url = urljoin(goodreads_url, '/search?q=' + quote_plus(query))
-    log.info('Searching Goodreads for book: %s' % search_url)
-    doc, final_url = open_url(log, search_url)
-    if final_url is None:
-        return None
-    if final_url != search_url:
-        # There was a perfect match and we were redirected to the edition
-        return urljoin(goodreads_url, final_url)
-    # There was no perfect match, get the first result
-    if doc is None:
-        return None
-    books = doc.xpath('//*[@itemtype="http://schema.org/Book"]')
-    if not books:
-        return None
-    urls = books[0].xpath('.//*[@itemprop="url"]/@href')
-    if not urls:
-        return None
-    return urljoin(goodreads_url, urls[0])
 
 def search_asins_goodreads(log, edition):
     try:
