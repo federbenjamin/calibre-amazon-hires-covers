@@ -17,7 +17,7 @@ class KindleHighResCovers(Source):
     description             = 'Downloads high resolution covers for Kindle editions from Amazon'
     capabilities            = frozenset(['cover'])
     author                  = 'Leonardo Brondani Schenkel <leonardo@schenkel.net>'
-    version                 = (0, 6, 0)
+    version                 = (0, 7, 0)
     can_get_multiple_covers = True
 
     KEY_MAX_COVERS = 'max_covers'
