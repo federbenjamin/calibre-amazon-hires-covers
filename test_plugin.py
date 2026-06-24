@@ -6,8 +6,8 @@
 #
 #   /Applications/calibre.app/Contents/MacOS/calibre-debug -e test_plugin.py
 #
-# The network (browser) and calibre's Amazon source (metadata_plugins) are
-# stubbed, so the tests are deterministic and never touch the internet.
+# All network access is stubbed -- browser() for HTML fetches and fetch_bytes()
+# for image fetches -- so the tests are deterministic and never hit the network.
 
 import importlib.util
 import os
@@ -24,7 +24,17 @@ import calibre.customize.ui as calibre_ui
 from calibre.ebooks.metadata.book.base import Metadata
 
 GOODREADS = khrc.goodreads_url
-SCRM = 'https://ec2.images-amazon.com/images/P/%s.01.MAIN._SCRM_.jpg'
+SCL = 'https://m.media-amazon.com/images/P/%s.01._SCLZZZZZZZ_.jpg'        # primary CDN
+SCL2 = 'https://images-na.ssl-images-amazon.com/images/P/%s.01._SCLZZZZZZZ_.jpg'  # fallback CDN
+
+# Real image bodies vs Amazon's 43-byte 1x1 GIF "no cover" placeholder.
+JPEG = b'\xff\xd8\xff\xe0' + b'\x00' * 2000
+PNG = b'\x89PNG\r\n\x1a\n' + b'\x00' * 2000
+# The exact 43-byte 1x1 GIF Amazon serves when it has no cover for an ASIN.
+PLACEHOLDER_GIF = bytes.fromhex(
+    '47494638396101000100800100000000ffffff21f90401000001002c00000000010001000002024c01003b')
+
+_ORIG_FETCH_BYTES = khrc.fetch_bytes
 
 
 # --- test doubles ------------------------------------------------------------
@@ -53,8 +63,8 @@ class FakeResponse(object):
 
 
 class FakeBrowser(object):
-    """One simulated HTTP fetch: a body, an optional post-redirect URL, or an
-    error raised from open() (mimicking mechanize's HTTP 503/403 etc.)."""
+    """One simulated fetch: a body, an optional post-redirect URL, or an error
+    raised from open() (mimicking mechanize's HTTP 503/403 etc.)."""
     def __init__(self, body='', final_url=None, error=None):
         self._body, self._final_url, self._error, self._opened = body, final_url, error, None
 
@@ -69,8 +79,8 @@ class FakeBrowser(object):
 
 
 class BrowserFactory(object):
-    """Stands in for the module-level browser(); hands out FakeBrowsers in order
-    and counts calls so tests can assert the network was (not) used."""
+    """Stands in for browser(); hands out FakeBrowsers in order and counts calls
+    so tests can assert the network was (not) used."""
     def __init__(self, browsers=None, always=None):
         self.queue = list(browsers) if browsers else []
         self.always = always
@@ -101,6 +111,16 @@ class FakeAmazonSource(object):
             result_queue.put(mi)
 
 
+class AmazonSpy(object):
+    """Stands in for metadata_plugins(); counts calls."""
+    def __init__(self, plugins):
+        self.plugins, self.calls = plugins, 0
+
+    def __call__(self, capabilities=None):
+        self.calls += 1
+        return self.plugins
+
+
 def use_browsers(browsers=None, always=None):
     factory = BrowserFactory(browsers=browsers, always=always)
     khrc.browser = factory
@@ -108,7 +128,19 @@ def use_browsers(browsers=None, always=None):
 
 
 def use_amazon(plugins):
-    calibre_ui.metadata_plugins = lambda caps=None: plugins
+    spy = AmazonSpy(plugins)
+    calibre_ui.metadata_plugins = spy
+    return spy
+
+
+def use_covers(mapping, default=PLACEHOLDER_GIF):
+    """Stub fetch_bytes: any URL containing an ASIN key returns its bytes."""
+    def fake(log, url, timeout):
+        for asin, data in mapping.items():
+            if asin in url:
+                return data
+        return default
+    khrc.fetch_bytes = fake
 
 
 HTTP_503 = Exception('HTTP Error 503: Service Unavailable')
@@ -132,9 +164,10 @@ def eq(name, got, expected):
     check(name, got == expected, '(got %r, expected %r)' % (got, expected))
 
 
-# --- #1: ISBN -> ASIN helpers ------------------------------------------------
+# --- ISBN -> ASIN helpers ----------------------------------------------------
 def test_isbn_to_asin():
     eq('isbn13->isbn10', khrc.isbn_to_asin('9780441013593'), '0441013597')
+    eq('blood meridian', khrc.isbn_to_asin('9780307762528'), '0307762521')
     eq('isbn13 hyphens', khrc.isbn_to_asin('978-0-13-468599-1'), '0134685997')
     eq('isbn10 passthrough', khrc.isbn_to_asin('0441013597'), '0441013597')
     eq('isbn10 with X', khrc.isbn_to_asin('043935806X'), '043935806X')
@@ -170,7 +203,7 @@ def test_parse_response():
     check('valid html -> doc', doc is not None and doc.xpath('//p/text()') == ['hi'])
 
 
-# --- open_url: the boundary that was crashing --------------------------------
+# --- open_url: the HTTP boundary that was crashing ---------------------------
 def test_open_url():
     log = FakeLog()
 
@@ -187,11 +220,58 @@ def test_open_url():
     check('valid -> (doc, url)', doc is not None and doc.xpath('//b/text()') == ['ok'])
 
 
+# --- fetch_bytes / is_valid_cover: placeholder rejection ---------------------
+def test_fetch_bytes():
+    khrc.fetch_bytes = _ORIG_FETCH_BYTES  # exercise the real implementation
+    log = FakeLog()
+
+    use_browsers([FakeBrowser(body=JPEG)])
+    eq('returns image bytes', khrc.fetch_bytes(log, 'http://x/c.jpg', 5), JPEG)
+
+    use_browsers(always=FakeBrowser(error=HTTP_503))
+    eq('503 -> None', khrc.fetch_bytes(log, 'http://x/c.jpg', 5), None)
+
+
+def test_is_valid_cover():
+    khrc.fetch_bytes = _ORIG_FETCH_BYTES
+    log = FakeLog()
+
+    use_browsers([FakeBrowser(body=PLACEHOLDER_GIF)])
+    eq('43-byte gif placeholder -> False', khrc.is_valid_cover(log, SCL % 'X', 5), False)
+
+    use_browsers([FakeBrowser(body=JPEG)])
+    eq('real jpeg -> True', khrc.is_valid_cover(log, SCL % 'X', 5), True)
+
+    use_browsers([FakeBrowser(body=PNG)])
+    eq('real png -> True', khrc.is_valid_cover(log, SCL % 'X', 5), True)
+
+    use_browsers([FakeBrowser(body=b'\xff\xd8\xff' + b'\x00' * 10)])
+    eq('tiny jpeg -> False', khrc.is_valid_cover(log, SCL % 'X', 5), False)
+
+    use_browsers(always=FakeBrowser(error=HTTP_503))
+    eq('fetch fails -> False', khrc.is_valid_cover(log, SCL % 'X', 5), False)
+
+
+# --- cover_urls_for_asin: CDN failover, one url per asin ----------------------
+def test_cover_urls_for_asin():
+    log = FakeLog()
+
+    use_covers({'AAAA': JPEG})
+    eq('primary cdn valid', khrc.cover_urls_for_asin(log, 'AAAA', 5), [SCL % 'AAAA'])
+
+    # Primary host serves a placeholder, fallback host has the real cover.
+    def fake(log, url, timeout):
+        return JPEG if url.startswith('https://images-na.') else PLACEHOLDER_GIF
+    khrc.fetch_bytes = fake
+    eq('falls over to second cdn', khrc.cover_urls_for_asin(log, 'BBBB', 5), [SCL2 % 'BBBB'])
+
+    use_covers({})  # every host returns the placeholder
+    eq('no valid cover -> []', khrc.cover_urls_for_asin(log, 'CCCC', 5), [])
+
+
 # --- search_edition_goodreads ------------------------------------------------
 def test_search_edition_goodreads():
     log = FakeLog()
-    search_url = khrc.urljoin(GOODREADS, '/search?q=neuromancer')
-
     use_browsers(always=FakeBrowser(error=HTTP_503))
     eq('503 -> None', khrc.search_edition_goodreads(log, 'neuromancer'), None)
 
@@ -201,7 +281,7 @@ def test_search_edition_goodreads():
 
     page = '<html><body><div itemtype="http://schema.org/Book">' \
            '<a itemprop="url" href="/book/show/555">x</a></div></body></html>'
-    use_browsers([FakeBrowser(body=page)])  # geturl() == opened url == search_url
+    use_browsers([FakeBrowser(body=page)])
     eq('first result -> edition', khrc.search_edition_goodreads(log, 'neuromancer'),
        GOODREADS + '/book/show/555')
 
@@ -230,7 +310,7 @@ def test_search_asins_goodreads():
     eq('editions 503 -> set()', khrc.search_asins_goodreads(log, '8812697'), set())
 
 
-# --- #2: search_asins_amazon -------------------------------------------------
+# --- search_asins_amazon -----------------------------------------------------
 def test_search_asins_amazon():
     log = FakeLog()
     from threading import Event
@@ -246,47 +326,65 @@ def test_search_asins_amazon():
     eq('identify raises -> set()', khrc.search_asins_amazon(log, 'T', ['A'], {}, 5, Event()), set())
 
 
-# --- get_cover_urls: end-to-end fallback behaviour ---------------------------
+# --- get_cover_urls: end-to-end behaviour ------------------------------------
 def test_get_cover_urls():
     log = FakeLog()
 
-    # The reported crash: Goodreads id present, Goodreads returns HTTP 503.
-    # Must NOT raise, and must fall through to the ISBN-derived ASIN (#1).
+    # The reported bug: Goodreads 503, ISBN present. Must NOT crash, must emit the
+    # working _SCLZZZZZZZ_ url for the ISBN-derived ASIN, and must NOT touch the
+    # Google-scraping Amazon source because a real cover was already found.
     b = use_browsers(always=FakeBrowser(error=HTTP_503))
-    use_amazon([])  # isolate #1 by making #2 yield nothing
-    urls = khrc.get_cover_urls(log, 'Neuromancer', ['William Gibson'],
-                               {'goodreads': '8812697', 'isbn': '9780441013593'}, 5)
-    eq('503 falls back to ISBN-10', urls, [SCRM % '0441013597'])
-    check('goodreads was attempted', b.calls >= 1)
+    amz = use_amazon([FakeAmazonSource(asins=['SHOULD_NOT'])])
+    use_covers({'0307762521': JPEG})
+    urls = khrc.get_cover_urls(log, 'Blood Meridian', ['Cormac McCarthy'],
+                               {'goodreads': '8812697', 'isbn': '9780307762528'}, 5)
+    eq('isbn cover, real url', urls, [SCL % '0307762521'])
+    check('goodreads attempted', b.calls >= 1)
+    eq('amazon source NOT called', amz.calls, 0)
 
-    # ASIN already in metadata -> used directly, no network at all.
-    b = use_browsers(always=FakeBrowser(error=AssertionError('should not be called')))
-    use_amazon([FakeAmazonSource(asins=['SHOULD_NOT'])])
+    # ISBN-derived ASIN has no cover (placeholder) -> escalate to Amazon source,
+    # whose Kindle ASIN does have a cover.
+    use_browsers(always=FakeBrowser(error=HTTP_503))
+    amz = use_amazon([FakeAmazonSource(asins=['B00X57B4JG'])])
+    use_covers({'B00X57B4JG': JPEG})  # 0307762521 -> placeholder (default)
+    urls = khrc.get_cover_urls(log, 'Blood Meridian', ['Cormac McCarthy'],
+                               {'isbn': '9780307762528'}, 5)
+    eq('escalates to amazon when isbn has no cover', urls, [SCL % 'B00X57B4JG'])
+    check('amazon source WAS called', amz.calls >= 1)
+
+    # ASIN already in metadata, real cover -> used directly, no network at all.
+    b = use_browsers(always=FakeBrowser(error=AssertionError('no network expected')))
+    amz = use_amazon([FakeAmazonSource(asins=['SHOULD_NOT'])])
+    use_covers({'B00X57B4JG': JPEG})
     urls = khrc.get_cover_urls(log, 'T', ['A'], {'amazon': 'B00X57B4JG'}, 5)
-    eq('metadata asin used directly', urls, [SCRM % 'B00X57B4JG'])
-    eq('no network for metadata asin', b.calls, 0)
+    eq('metadata asin used directly', urls, [SCL % 'B00X57B4JG'])
+    eq('no goodreads for metadata asin', b.calls, 0)
+    eq('no amazon source for metadata asin', amz.calls, 0)
 
-    # No id, no ISBN: resolve via the Amazon source (#2).
-    b = use_browsers(always=FakeBrowser(error=AssertionError('should not be called')))
-    use_amazon([FakeAmazonSource(asins=['B00X57B4JG'])])
-    urls = khrc.get_cover_urls(log, 'Neuromancer', ['William Gibson'], {}, 5)
-    eq('amazon source resolves asin', urls, [SCRM % 'B00X57B4JG'])
-    eq('no goodreads when amazon wins', b.calls, 0)
-
-    # Goodreads id works -> true Kindle ASIN, Amazon source not consulted.
+    # Goodreads id resolves a Kindle ASIN with a cover -> Amazon source untouched.
     details = '<html><body><div class="otherEditionsLink">' \
               '<a href="/work/editions/123">All</a></div></body></html>'
     editions = '<html><body><div class="dataValue">B00X57B4JG</div></body></html>'
     use_browsers([FakeBrowser(body=details), FakeBrowser(body=editions)])
-    use_amazon([FakeAmazonSource(asins=['SHOULD_NOT'])])
+    amz = use_amazon([FakeAmazonSource(asins=['SHOULD_NOT'])])
+    use_covers({'B00X57B4JG': JPEG})
     urls = khrc.get_cover_urls(log, 'T', ['A'], {'goodreads': '8812697'}, 5)
-    eq('goodreads id resolves kindle asin', urls, [SCRM % 'B00X57B4JG'])
+    eq('goodreads id resolves cover', urls, [SCL % 'B00X57B4JG'])
+    eq('no amazon source when goodreads wins', amz.calls, 0)
+
+    # Nothing resolves a cover -> empty list, no crash.
+    use_browsers(always=FakeBrowser(error=HTTP_503))
+    use_amazon([])
+    use_covers({})
+    urls = khrc.get_cover_urls(log, 'Unknown', ['Nobody'], {'isbn': '9780307762528'}, 5)
+    eq('no cover anywhere -> []', urls, [])
 
 
 def main():
     tests = [
         test_isbn_to_asin, test_is_asin, test_is_kindle_asin, test_parse_response,
-        test_open_url, test_search_edition_goodreads, test_search_asins_goodreads,
+        test_open_url, test_fetch_bytes, test_is_valid_cover, test_cover_urls_for_asin,
+        test_search_edition_goodreads, test_search_asins_goodreads,
         test_search_asins_amazon, test_get_cover_urls,
     ]
     for t in tests:

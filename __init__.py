@@ -22,7 +22,7 @@ class KindleHighResCovers(Source):
     KEY_MAX_COVERS = 'max_covers'
 
     options = (Option(KEY_MAX_COVERS, 'number', 2, _('Maximum number of covers to get'),
-                      _('The maximum number of covers to get from amazon.com (since we try to get the covers from 2 sources, you might end up with two versions of each retrieved cover).')),
+                      _('The maximum number of covers to get from amazon.com.')),
     )
 
     def download_cover(self, log, result_queue, abort,
@@ -37,73 +37,117 @@ class KindleHighResCovers(Source):
                                           timeout, result_queue, abort, log,
                                           None)
 
+# Amazon's hi-res cover endpoint. {0} is the ASIN. The _SCLZZZZZZZ_ size code
+# asks for the largest available rendition. Two interchangeable CDN hostnames
+# are tried in order so a single unreachable host doesn't lose the cover.
+# (The old ec2.images-amazon.com/...MAIN._SCRM_.jpg endpoint now returns a
+# 43-byte 1x1 GIF placeholder for everything -- see is_valid_cover.)
+COVER_URL_FORMATS = (
+    'https://m.media-amazon.com/images/P/{0}.01._SCLZZZZZZZ_.jpg',
+    'https://images-na.ssl-images-amazon.com/images/P/{0}.01._SCLZZZZZZZ_.jpg',
+)
+# Amazon's "no cover" placeholder is a 43-byte 1x1 GIF. Real covers are tens of
+# KB of JPEG/PNG, so anything smaller than this is treated as a placeholder.
+MIN_COVER_BYTES = 1000
+
 def get_cover_urls(log, title, authors, identifiers, timeout, abort=None):
     if abort is None:
         abort = Event()
-    sources = frozenset([
-        'https://ec2.images-amazon.com/images/P/{0}.01.MAIN._SCRM_.jpg',
-        # No longer seem to work as of 2024-02-04:
-        #'http://z2-ec2.images-amazon.com/images/P/{0}.01.MAIN._SCRM_.jpg',
-        #'https://s3.cn-north-1.amazonaws.com.cn/sitbweb-cn/content/{0}/images/cover.jpg',
-    ])
-    urls = set()
-    asins = set()
-    # check for ASINs identifiers first
+
+    # Gather candidate ASINs from the cheapest/most-reliable sources first.
+    asins = []
+    def add_asin(value):
+        if value and value not in asins:
+            asins.append(value)
+
+    # 1. ASIN already in the book's metadata.
     for id, value in iteritems(identifiers):
         is_asin_id = id == 'asin' or id == 'mobi-asin' or id.startswith('amazon')
-        is_kindle  = is_kindle_asin(value)
-        if is_asin_id and is_kindle:
+        if is_asin_id and is_kindle_asin(value):
             log.info('ASIN present in metadata: %s' % value)
-            asins.add(value)
-    # otherwise use Goodreads id to find Kindle editions
+            add_asin(value)
+
+    # 2. Goodreads id -> Kindle editions (fails fast and gracefully if blocked).
     if not asins:
         log.info('ASIN not present in metadata')
         goodreads = identifiers.get('goodreads')
         if goodreads:
             log.info('Goodreads id present in metadata: %s' % goodreads)
-            asins = search_asins_goodreads(log, goodreads)
+            for value in search_asins_goodreads(log, goodreads):
+                add_asin(value)
         else:
             log.info('Goodreads id not present in metadata')
-    # otherwise resolve the ASIN without relying on Goodreads scraping:
-    #  #1 the Amazon ASIN of a print book is its ISBN-10, so derive it directly
-    #  #2 ask calibre's maintained Amazon source to resolve title/ISBN -> ASIN
-    # Both candidates are unioned; the download step validates each cover URL and
-    # discards misses (Amazon serves a placeholder image for unknown ASINs).
-    if not asins:
-        isbn = identifiers.get('isbn')
-        if isbn:
-            asin = isbn_to_asin(isbn)
-            if asin:
-                log.info('Derived ASIN from ISBN: %s' % asin)
-                asins.add(asin)
-        else:
-            log.info('ISBN not present in metadata')
-        amazon_asins = search_asins_amazon(log, title, authors, identifiers, timeout, abort)
-        if amazon_asins:
-            log.info('ASINs from Amazon source: %s' % ', '.join(sorted(amazon_asins)))
-            asins |= amazon_asins
-    # last resort: search Goodreads by ISBN or title+author (often blocked now)
-    if not asins:
-        isbn = identifiers.get('isbn')
-        if isbn:
-            query = isbn
-        else:
-            query = ''
-            if title:
-                query = title
-                if authors and authors[0]:
-                    query = query + ' ' + authors[0]
+
+    # 3. ISBN -> ASIN directly (Amazon's print ASIN is the ISBN-10). No network.
+    isbn = identifiers.get('isbn')
+    if isbn:
+        asin = isbn_to_asin(isbn)
+        if asin:
+            log.info('Derived ASIN from ISBN: %s' % asin)
+            add_asin(asin)
+    else:
+        log.info('ISBN not present in metadata')
+
+    # Validate the cheap candidates; keep only ASINs that have a real cover.
+    urls = cover_urls_for_asins(log, asins, timeout)
+
+    # 4. Only now, if nothing has a cover, pay for calibre's Amazon source
+    #    (it scrapes search engines and is slow/rate-limited).
+    if not urls:
+        log.info('No cover yet; falling back to calibre Amazon source')
+        extra = [a for a in search_asins_amazon(log, title, authors, identifiers, timeout, abort)
+                 if a not in asins]
+        urls = cover_urls_for_asins(log, extra, timeout)
+        asins.extend(extra)
+
+    # 5. Last resort: search Goodreads by ISBN or title+author (often blocked).
+    if not urls:
+        query = isbn
+        if not query and title:
+            query = title
+            if authors and authors[0]:
+                query = query + ' ' + authors[0]
         if query:
             edition = search_edition_goodreads(log, query)
             if edition:
-                asins = search_asins_goodreads(log, edition)
-    # now convert all ASINs into the download URLs
-    if asins:
-        for asin in asins:
-            for source in sources:
-                url = source.format(asin)
-                urls.add(url)
-    return list(urls)
+                extra = [a for a in search_asins_goodreads(log, edition) if a not in asins]
+                urls = cover_urls_for_asins(log, extra, timeout)
+
+    return urls
+
+def cover_urls_for_asins(log, asins, timeout):
+    urls = []
+    for asin in asins:
+        urls.extend(cover_urls_for_asin(log, asin, timeout))
+    return urls
+
+def cover_urls_for_asin(log, asin, timeout):
+    # Return the first CDN URL that actually serves a real cover for this ASIN
+    # (one per ASIN, so the user isn't handed duplicate covers).
+    for fmt in COVER_URL_FORMATS:
+        url = fmt.format(asin)
+        if is_valid_cover(log, url, timeout):
+            log.info('Valid cover: %s' % url)
+            return [url]
+    log.info('No valid cover for ASIN %s' % asin)
+    return []
+
+def is_valid_cover(log, url, timeout):
+    # Reject Amazon's placeholder (a 43-byte 1x1 GIF) before handing the URL to
+    # calibre. A real cover is a non-trivial JPEG/PNG.
+    data = fetch_bytes(log, url, timeout)
+    if not data or len(data) < MIN_COVER_BYTES:
+        return False
+    return data.startswith(b'\xff\xd8\xff') or data.startswith(b'\x89PNG\r\n\x1a\n')
+
+def fetch_bytes(log, url, timeout):
+    try:
+        br = browser()
+        with closing(br.open(url)) as response:
+            return response.read()
+    except Exception as e:
+        log.error('Failed to fetch %s: %s' % (url, e))
+        return None
 
 def is_kindle_asin(value):
     return value and len(value) == 10 and value.startswith('B')
