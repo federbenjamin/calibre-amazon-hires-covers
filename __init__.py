@@ -184,69 +184,68 @@ def parse_response(log, response):
         log.error('Failed to parse Goodreads response: %s' % e)
         return None
 
-def search_edition_goodreads(log, query):
-    edition_url = None
+def open_url(log, url):
+    # Open a URL and return (doc, final_url). On any failure -- HTTP errors like
+    # 503/403, network errors, timeouts, or an empty/unparseable body -- log and
+    # return (None, None) so callers degrade gracefully instead of raising.
+    try:
+        br = browser()
+        with closing(br.open(url)) as response:
+            final_url = br.geturl()
+            return parse_response(log, response), final_url
+    except Exception as e:
+        log.error('Failed to fetch %s: %s' % (url, e))
+        return None, None
 
-    br = browser()
+def search_edition_goodreads(log, query):
     search_url = urljoin(goodreads_url, '/search?q=' + quote_plus(query))
     log.info('Searching Goodreads for book: %s' % search_url)
-    with closing(br.open(search_url)) as response:
-        url = br.geturl()
-        if url == search_url:
-            # There was no perfect match, get the first result
-            doc = parse_response(log, response)
-            if doc is None:
-                return None
-            edition_url = None
-            books = doc.xpath('//*[@itemtype="http://schema.org/Book"]')
-            if books:
-                book = books[0]
-                url = book.xpath('.//*[@itemprop="url"]/@href')[0]
-                if url:
-                    edition_url = url
-        else:
-            # There was a perfect match and we were redirected to the edition
-            edition_url = url
-
-    if edition_url:
-        edition_url = urljoin(goodreads_url, edition_url)
-    return edition_url
+    doc, final_url = open_url(log, search_url)
+    if final_url is None:
+        return None
+    if final_url != search_url:
+        # There was a perfect match and we were redirected to the edition
+        return urljoin(goodreads_url, final_url)
+    # There was no perfect match, get the first result
+    if doc is None:
+        return None
+    books = doc.xpath('//*[@itemtype="http://schema.org/Book"]')
+    if not books:
+        return None
+    urls = books[0].xpath('.//*[@itemprop="url"]/@href')
+    if not urls:
+        return None
+    return urljoin(goodreads_url, urls[0])
 
 def search_asins_goodreads(log, edition):
     try:
-        number = int(edition)
-        edition_url = '/book/show/' + str(number)
-    except ValueError:
+        edition_url = '/book/show/' + str(int(edition))
+    except (ValueError, TypeError):
         edition_url = edition
     edition_url = urljoin(goodreads_url, edition_url)
 
-    br = browser()
     # parse the details page and get the link to list all editions
     log.info('Fetching book details: %s' % edition_url)
-    with closing(br.open(edition_url)) as response:
-        doc = parse_response(log, response)
-        if doc is None:
-            return set()
-        editions_url = doc.xpath('//div[@class="otherEditionsLink"]/a/@href')
-        if editions_url:
-            editions_url = editions_url[0]
-        else:
-            return set()
-        editions_url = urljoin(goodreads_url, editions_url)
+    doc, _ = open_url(log, edition_url)
+    if doc is None:
+        return set()
+    editions_url = doc.xpath('//div[@class="otherEditionsLink"]/a/@href')
+    if not editions_url:
+        return set()
+    editions_url = urljoin(goodreads_url, editions_url[0])
 
     # list all Kindle editions of the book
     editions_url = urljoin(editions_url, '?expanded=true&filter_by_format=Kindle+Edition&per_page=100')
     log.info('Fetching Kindle editions: %s' % editions_url)
-    with closing(br.open(editions_url)) as response:
-        doc = parse_response(log, response)
-        if doc is None:
-            return set()
-        asins = set()
-        for value in doc.xpath('//*[@class="dataValue"]//text()'):
-            value = value.strip()
-            if is_kindle_asin(value):
-                asins.add(value)
-        return asins
+    doc, _ = open_url(log, editions_url)
+    if doc is None:
+        return set()
+    asins = set()
+    for value in doc.xpath('//*[@class="dataValue"]//text()'):
+        value = value.strip()
+        if is_kindle_asin(value):
+            asins.add(value)
+    return asins
 
 import getopt
 import logging
